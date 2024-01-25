@@ -2,20 +2,30 @@
 name = "bus"
 version = "2.4.1"
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
-edition = "2018"
+edition = "2021"
 license = "MIT OR Apache-2.0"
 
 readme = "README.md"
-description = "A lock-free, bounded, single-producer, multi-consumer, broadcast channel."
 repository = "https://github.com/jonhoo/bus.git"
+description = "A lock-free, bounded, single-producer, multi-consumer, broadcast channel."
 
-keywords = ["channel","broadcast","lock-free"]
 categories = ["concurrency"]
-
-[dependencies]
-num_cpus = "1.6.2"
-parking_lot_core = "0.9"
-crossbeam-channel = "0.5"
+keywords = ["channel", "broadcast", "lock-free"]
 
 [profile.release]
 debug = true
+
+[lints.rust]
+future_incompatible = "deny"
+let_underscore = "deny"
+nonstandard_style = "deny"
+rust_2018_compatibility = "deny"
+rust_2018_idioms = "deny"
+rust_2021_compatibility = "deny"
+unused = "deny"
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+nursery = "deny"
