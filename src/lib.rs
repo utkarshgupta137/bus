@@ -105,6 +105,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crossbeam_utils::CachePadded;
+
 struct SeatState<T> {
     max: usize,
     val: Option<T>,
@@ -139,7 +141,7 @@ impl<T> fmt::Debug for MutSeatState<T> {
 /// The `read` attribute is used to ensure that readers see the most recent write to the seat when
 /// they access it. This is done using `Ordering::Acquire` and `Ordering::Release`.
 struct Seat<T> {
-    read: AtomicUsize,
+    read: CachePadded<AtomicUsize>,
     state: MutSeatState<T>,
 }
 
@@ -212,7 +214,7 @@ impl<T: Clone + Sync> Seat<T> {
 impl<T> Default for Seat<T> {
     fn default() -> Self {
         Self {
-            read: AtomicUsize::new(0),
+            read: CachePadded::new(AtomicUsize::new(0)),
             state: MutSeatState(UnsafeCell::new(SeatState { max: 0, val: None })),
         }
     }
@@ -222,9 +224,9 @@ impl<T> Default for Seat<T> {
 /// only ever modified by the producer, and read by the consumers. The length of the bus is
 /// instantiated when the bus is created, and is never modified.
 struct BusInner<T> {
+    tail: CachePadded<AtomicUsize>,
     ring: Box<[Seat<T>]>,
     len: usize,
-    tail: AtomicUsize,
     closed: AtomicBool,
 }
 
@@ -269,8 +271,8 @@ impl<T> Bus<T> {
     #[must_use]
     pub fn new(len: usize) -> Self {
         let inner = Arc::new(BusInner {
+            tail: CachePadded::new(AtomicUsize::new(0)),
             ring: (0..len).map(|_| Seat::default()).collect(),
-            tail: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             len,
         });
