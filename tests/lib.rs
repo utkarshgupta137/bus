@@ -1,5 +1,3 @@
-extern crate bus;
-
 use std::sync::mpsc;
 use std::time;
 
@@ -91,7 +89,7 @@ fn it_iterates() {
     });
 
     let mut ii = 0;
-    for i in rx.iter() {
+    while let Ok(i) = rx.try_recv() {
         assert_eq!(i, ii);
         ii += 1;
     }
@@ -116,7 +114,7 @@ fn aggressive_iteration() {
         });
 
         let mut ii = 0;
-        for i in rx.iter() {
+        while let Ok(i) = rx.try_recv() {
             assert_eq!(i, ii);
             ii += 1;
         }

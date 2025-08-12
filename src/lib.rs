@@ -100,9 +100,9 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::atomic;
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 struct SeatState<T> {
@@ -137,9 +137,9 @@ impl<T> fmt::Debug for MutSeatState<T> {
 /// producer.
 ///
 /// The `read` attribute is used to ensure that readers see the most recent write to the seat when
-/// they access it. This is done using `atomic::Ordering::Acquire` and `atomic::Ordering::Release`.
+/// they access it. This is done using `Ordering::Acquire` and `Ordering::Release`.
 struct Seat<T> {
-    read: atomic::AtomicUsize,
+    read: AtomicUsize,
     state: MutSeatState<T>,
 }
 
@@ -157,7 +157,7 @@ impl<T: Clone + Sync> Seat<T> {
     /// that were created strictly before the time this seat was last written to by the producer
     /// are allowed to call this method, and they may each only call it once.
     fn take(&self) -> T {
-        let read = self.read.load(atomic::Ordering::Acquire);
+        let read = self.read.load(Ordering::Acquire);
 
         // the writer will only modify this element when .read hits .max - writer.rleft[i]. we can
         // be sure that this is not currently the case (which means it's safe for us to read)
@@ -203,7 +203,7 @@ impl<T: Clone + Sync> Seat<T> {
             v
         };
 
-        self.read.fetch_add(1, atomic::Ordering::AcqRel);
+        self.read.fetch_add(1, Ordering::AcqRel);
 
         v
     }
@@ -212,7 +212,7 @@ impl<T: Clone + Sync> Seat<T> {
 impl<T> Default for Seat<T> {
     fn default() -> Self {
         Self {
-            read: atomic::AtomicUsize::new(0),
+            read: AtomicUsize::new(0),
             state: MutSeatState(UnsafeCell::new(SeatState { max: 0, val: None })),
         }
     }
@@ -224,8 +224,8 @@ impl<T> Default for Seat<T> {
 struct BusInner<T> {
     ring: Box<[Seat<T>]>,
     len: usize,
-    tail: atomic::AtomicUsize,
-    closed: atomic::AtomicBool,
+    tail: AtomicUsize,
+    closed: AtomicBool,
 }
 
 impl<T> fmt::Debug for BusInner<T> {
@@ -270,8 +270,8 @@ impl<T> Bus<T> {
     pub fn new(len: usize) -> Self {
         let inner = Arc::new(BusInner {
             ring: (0..len).map(|_| Seat::default()).collect(),
-            tail: atomic::AtomicUsize::new(0),
-            closed: atomic::AtomicBool::new(false),
+            tail: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
             len,
         });
 
@@ -300,7 +300,7 @@ impl<T> Bus<T> {
     ///
     /// Note that broadcasts will succeed even if there are no consumers!
     fn broadcast_inner(&mut self, val: T) -> Result<(), T> {
-        let tail = self.state.tail.load(atomic::Ordering::Relaxed);
+        let tail = self.state.tail.load(Ordering::Relaxed);
 
         // we want to check if the next element over is free to ensure that we always leave one
         // empty space between the head and the tail. This is necessary so that readers can
@@ -309,7 +309,7 @@ impl<T> Bus<T> {
         // reader).
         let fence = (tail + 1) % self.state.len;
 
-        let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
+        let fence_read = self.state.ring[fence].read.load(Ordering::Acquire);
 
         // is the fence block now free?
         if fence_read == self.expected(fence) {
@@ -337,10 +337,10 @@ impl<T> Bus<T> {
             let state = unsafe { &mut *next.state.get() };
             state.max = readers;
             state.val = Some(val);
-            next.read.store(0, atomic::Ordering::Release);
+            next.read.store(0, Ordering::Release);
         }
         // now tell readers that they can read
-        self.state.tail.store(fence, atomic::Ordering::Release);
+        self.state.tail.store(fence, Ordering::Release);
 
         Ok(())
     }
@@ -421,7 +421,7 @@ impl<T> Bus<T> {
 
         BusReader {
             bus: Arc::clone(&self.state),
-            head: self.state.tail.load(atomic::Ordering::Relaxed),
+            head: self.state.tail.load(Ordering::Relaxed),
             closed: false,
         }
     }
@@ -453,9 +453,9 @@ impl<T> Bus<T> {
 
 impl<T> Drop for Bus<T> {
     fn drop(&mut self) {
-        self.state.closed.store(true, atomic::Ordering::Relaxed);
+        self.state.closed.store(true, Ordering::Relaxed);
         // Acquire/Release .tail to ensure other threads see new .closed
-        self.state.tail.fetch_add(0, atomic::Ordering::AcqRel);
+        self.state.tail.fetch_add(0, Ordering::AcqRel);
     }
 }
 
@@ -506,22 +506,22 @@ impl<T: Clone + Sync> BusReader<T> {
     /// `Err(mpsc::RecvTimeoutError::Timeout)` is returned. Otherwise, the current thread will be
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
-    fn recv_inner(&mut self) -> Result<T, std_mpsc::TryRecvError> {
+    fn recv_inner(&mut self) -> Result<T, TryRecvError> {
         if self.closed {
-            return Err(std_mpsc::TryRecvError::Disconnected);
+            return Err(TryRecvError::Disconnected);
         }
 
-        let tail = self.bus.tail.load(atomic::Ordering::Acquire);
+        let tail = self.bus.tail.load(Ordering::Acquire);
         if tail == self.head {
             // buffer is empty, check whether it's closed.
             // relaxed is fine since Bus.drop does an acquire/release on tail
-            if self.bus.closed.load(atomic::Ordering::Relaxed) {
+            if self.bus.closed.load(Ordering::Relaxed) {
                 // the bus is closed, and we didn't miss anything!
                 self.closed = true;
-                return Err(std_mpsc::TryRecvError::Disconnected);
+                return Err(TryRecvError::Disconnected);
             }
 
-            return Err(std_mpsc::TryRecvError::Empty);
+            return Err(TryRecvError::Empty);
         }
 
         let head = self.head;
@@ -573,7 +573,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// j.join().unwrap();
     /// ```
     #[allow(clippy::missing_errors_doc)]
-    pub fn try_recv(&mut self) -> Result<T, std_mpsc::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         self.recv_inner()
     }
 
@@ -588,13 +588,13 @@ impl<T: Clone + Sync> BusReader<T> {
     /// received on this channel. However, since channels are buffered, messages sent before the
     /// disconnect will still be properly received.
     #[allow(clippy::missing_errors_doc)]
-    pub fn recv(&mut self) -> Result<T, std_mpsc::RecvError> {
+    pub fn recv(&mut self) -> Result<T, RecvError> {
         loop {
             match self.recv_inner() {
                 Ok(val) => return Ok(val),
-                Err(std_mpsc::TryRecvError::Empty) => {}
-                Err(std_mpsc::TryRecvError::Disconnected) => {
-                    return Err(std_mpsc::RecvError);
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err(RecvError);
                 }
             }
         }
@@ -626,18 +626,18 @@ impl<T: Clone + Sync> BusReader<T> {
     /// assert_eq!(Err(RecvTimeoutError::Timeout), rx.recv_timeout(timeout));
     /// ```
     #[allow(clippy::missing_errors_doc)]
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<T, std_mpsc::RecvTimeoutError> {
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         let start = Instant::now();
         loop {
             match self.recv_inner() {
                 Ok(val) => return Ok(val),
-                Err(std_mpsc::TryRecvError::Empty) => {
+                Err(TryRecvError::Empty) => {
                     if start.elapsed() >= timeout {
-                        return Err(std_mpsc::RecvTimeoutError::Timeout);
+                        return Err(RecvTimeoutError::Timeout);
                     }
                 }
-                Err(std_mpsc::TryRecvError::Disconnected) => {
-                    return Err(std_mpsc::RecvTimeoutError::Disconnected);
+                Err(TryRecvError::Disconnected) => {
+                    return Err(RecvTimeoutError::Disconnected);
                 }
             }
         }

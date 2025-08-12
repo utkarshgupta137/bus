@@ -2,7 +2,7 @@
 name = "bus"
 version = "2.4.1"
 authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 
 readme = "README.md"
@@ -16,12 +16,15 @@ keywords = ["channel", "broadcast", "lock-free"]
 debug = true
 
 [lints.rust]
+deprecated_safe = "deny"
 future_incompatible = "deny"
 let_underscore = "deny"
 nonstandard_style = "deny"
+refining_impl_trait = "deny"
 rust_2018_compatibility = "deny"
 rust_2018_idioms = "deny"
 rust_2021_compatibility = "deny"
+rust_2024_compatibility = "deny"
 unused = "deny"
 warnings = "deny"
 
