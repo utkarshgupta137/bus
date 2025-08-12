@@ -159,8 +159,6 @@ impl<T: Clone + Sync> Seat<T> {
     /// that were created strictly before the time this seat was last written to by the producer
     /// are allowed to call this method, and they may each only call it once.
     fn take(&self) -> T {
-        let read = self.read.load(Ordering::Acquire);
-
         // the writer will only modify this element when .read hits .max - writer.rleft[i]. we can
         // be sure that this is not currently the case (which means it's safe for us to read)
         // because:
@@ -180,32 +178,16 @@ impl<T: Clone + Sync> Seat<T> {
         //  - since we are one of those readers, this cannot be true, so it's safe for us to assume
         //    that there is no concurrent writer for this seat
         let state = unsafe { &*self.state.get() };
-        debug_assert!(
-            read < state.max,
-            "reader hit seat with exhausted reader count"
-        );
 
         // NOTE
         // we must extract the value *before* we decrement the number of remaining items otherwise,
         // the object might be replaced by the time we read it!
-        let v = if read + 1 == state.max {
-            // since we're the last reader, no-one else will be cloning this value, so we can
-            // safely take a mutable reference, and just take the val instead of cloning it.
-            unsafe { &mut *self.state.get() }.val.take().unwrap()
-        } else {
-            let v = state
-                .val
-                .clone()
-                .expect("seat that should be occupied was empty");
+        let v = state
+            .val
+            .clone()
+            .expect("seat that should be occupied was empty");
 
-            // let writer know that we no longer need this item.
-            // state is no longer safe to access.
-            #[allow(dropping_references)]
-            drop(state);
-            v
-        };
-
-        self.read.fetch_add(1, Ordering::AcqRel);
+        self.read.fetch_add(1, Ordering::Relaxed);
 
         v
     }
@@ -311,7 +293,7 @@ impl<T> Bus<T> {
         // reader).
         let fence = (tail + 1) % self.state.len;
 
-        let fence_read = self.state.ring[fence].read.load(Ordering::Acquire);
+        let fence_read = self.state.ring[fence].read.load(Ordering::Relaxed);
 
         // is the fence block now free?
         if fence_read == self.expected(fence) {
@@ -339,7 +321,7 @@ impl<T> Bus<T> {
             let state = unsafe { &mut *next.state.get() };
             state.max = readers;
             state.val = Some(val);
-            next.read.store(0, Ordering::Release);
+            next.read.store(0, Ordering::Relaxed);
         }
         // now tell readers that they can read
         self.state.tail.store(fence, Ordering::Release);
