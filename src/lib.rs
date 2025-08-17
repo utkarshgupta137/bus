@@ -208,7 +208,7 @@ impl<T> Default for Seat<T> {
 struct BusInner<T> {
     tail: CachePadded<AtomicUsize>,
     ring: Box<[Seat<T>]>,
-    len: usize,
+    mask: usize,
     closed: AtomicBool,
 }
 
@@ -216,7 +216,7 @@ impl<T> fmt::Debug for BusInner<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BusInner")
             .field("ring", &self.ring)
-            .field("len", &self.len)
+            .field("len", &(self.mask + 1))
             .field("tail", &self.tail)
             .field("closed", &self.closed)
             .finish()
@@ -252,11 +252,12 @@ impl<T> Bus<T> {
     /// generally better to set this high than low unless you are pressed for memory.
     #[must_use]
     pub fn new(len: usize) -> Self {
+        assert!(len.is_power_of_two(), "size must be a power of 2.");
         let inner = Arc::new(BusInner {
             tail: CachePadded::new(AtomicUsize::new(0)),
             ring: (0..len).map(|_| Seat::default()).collect(),
+            mask: len - 1,
             closed: AtomicBool::new(false),
-            len,
         });
 
         Self {
@@ -291,7 +292,7 @@ impl<T> Bus<T> {
         // distinguish between an empty and a full list. If the fence seat is free, the seat at
         // tail must also be free, which is simple enough to show by induction (exercise for the
         // reader).
-        let fence = (tail + 1) % self.state.len;
+        let fence = (tail + 1) & self.state.mask;
 
         let fence_read = self.state.ring[fence].read.load(Ordering::Relaxed);
 
@@ -511,8 +512,8 @@ impl<T: Clone + Sync> BusReader<T> {
         let head = self.head;
         let ret = self.bus.ring[head].take();
 
-        // safe because len is read-only
-        self.head = (head + 1) % self.bus.len;
+        // safe because mask is read-only
+        self.head = (head + 1) & self.bus.mask;
         Ok(ret)
     }
 
