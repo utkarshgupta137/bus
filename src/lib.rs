@@ -154,45 +154,6 @@ impl<T> fmt::Debug for Seat<T> {
     }
 }
 
-impl<T: Clone + Sync> Seat<T> {
-    /// take is used by a reader to extract a copy of the value stored on this seat. only readers
-    /// that were created strictly before the time this seat was last written to by the producer
-    /// are allowed to call this method, and they may each only call it once.
-    fn take(&self) -> T {
-        // the writer will only modify this element when .read hits .max - writer.rleft[i]. we can
-        // be sure that this is not currently the case (which means it's safe for us to read)
-        // because:
-        //
-        //  - .max is set to the number of readers at the time when the write happens
-        //  - any joining readers will start at a later seat
-        //  - so, at most .max readers will call .take() on this seat this time around the buffer
-        //  - a reader must leave either *before* or *after* a call to recv. there are two cases:
-        //
-        //    - it leaves before, rleft is decremented, but .take is not called
-        //    - it leaves after, .take is called, but head has been incremented, so rleft will be
-        //      decremented for the *next* seat, not this one
-        //
-        //    so, either .take is called, and .read is incremented, or writer.rleft is incremented.
-        //    thus, for a writer to modify this element, *all* readers at the time of the previous
-        //    write to this seat must have either called .take or have left.
-        //  - since we are one of those readers, this cannot be true, so it's safe for us to assume
-        //    that there is no concurrent writer for this seat
-        let state = unsafe { &*self.state.get() };
-
-        // NOTE
-        // we must extract the value *before* we decrement the number of remaining items otherwise,
-        // the object might be replaced by the time we read it!
-        let v = state
-            .val
-            .clone()
-            .expect("seat that should be occupied was empty");
-
-        self.read.fetch_add(1, Ordering::Relaxed);
-
-        v
-    }
-}
-
 impl<T> Default for Seat<T> {
     fn default() -> Self {
         Self {
@@ -266,17 +227,6 @@ impl<T> Bus<T> {
         }
     }
 
-    /// Get the expected number of reads for the given seat. This number will always be
-    /// conservative, in that fewer reads may be fine. Specifically, `.rleft` may not be
-    /// sufficiently up-to-date to account for all readers that have left.
-    #[inline]
-    fn expected(&mut self, at: usize) -> usize {
-        // since only the producer will modify the ring, and &mut self guarantees that *we* are the
-        // producer, no-one is modifying the ring. Multiple read-only borrows are safe, and so the
-        // cast below is safe.
-        unsafe { &*self.state.ring[at].state.get() }.max
-    }
-
     /// Attempts to place the given value on the bus.
     ///
     /// If the bus is full, the behavior depends on `block`. If false, the value given is returned
@@ -294,10 +244,18 @@ impl<T> Bus<T> {
         // reader).
         let fence = (tail + 1) & self.state.mask;
 
-        let fence_read = self.state.ring[fence].read.load(Ordering::Relaxed);
+        let last = &self.state.ring[fence];
+        let fence_read = last.read.load(Ordering::Relaxed);
+        // Get the expected number of reads for the given seat. This number will always be
+        // conservative, in that fewer reads may be fine. Specifically, `.rleft` may not be
+        // sufficiently up-to-date to account for all readers that have left.
+        // since only the producer will modify the ring, and &mut self guarantees that *we* are the
+        // producer, no-one is modifying the ring. Multiple read-only borrows are safe, and so the
+        // cast below is safe.
+        let expected = unsafe { &*last.state.get() }.max;
 
         // is the fence block now free?
-        if fence_read == self.expected(fence) {
+        if fence_read == expected {
             // yes! go ahead and write!
         } else {
             // no, and blocking isn't allowed, so return an error
@@ -510,7 +468,40 @@ impl<T: Clone + Sync> BusReader<T> {
         }
 
         let head = self.head;
-        let ret = self.bus.ring[head].take();
+        let seat = &self.bus.ring[head];
+
+        // take is used by a reader to extract a copy of the value stored on this seat. only readers
+        // that were created strictly before the time this seat was last written to by the producer
+        // are allowed to call this method, and they may each only call it once.
+        // the writer will only modify this element when .read hits .max - writer.rleft[i]. we can
+        // be sure that this is not currently the case (which means it's safe for us to read)
+        // because:
+        //
+        //  - .max is set to the number of readers at the time when the write happens
+        //  - any joining readers will start at a later seat
+        //  - so, at most .max readers will call .take() on this seat this time around the buffer
+        //  - a reader must leave either *before* or *after* a call to recv. there are two cases:
+        //
+        //    - it leaves before, rleft is decremented, but .take is not called
+        //    - it leaves after, .take is called, but head has been incremented, so rleft will be
+        //      decremented for the *next* seat, not this one
+        //
+        //    so, either .take is called, and .read is incremented, or writer.rleft is incremented.
+        //    thus, for a writer to modify this element, *all* readers at the time of the previous
+        //    write to this seat must have either called .take or have left.
+        //  - since we are one of those readers, this cannot be true, so it's safe for us to assume
+        //    that there is no concurrent writer for this seat
+        let state = unsafe { &*seat.state.get() };
+
+        // NOTE
+        // we must extract the value *before* we decrement the number of remaining items otherwise,
+        // the object might be replaced by the time we read it!
+        let ret = state
+            .val
+            .clone()
+            .expect("seat that should be occupied was empty");
+
+        seat.read.fetch_add(1, Ordering::Relaxed);
 
         // safe because mask is read-only
         self.head = (head + 1) & self.bus.mask;
