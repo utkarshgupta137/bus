@@ -97,7 +97,7 @@
 //! assert_eq!(rx2.recv(), Ok("world"));
 //! ```
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -160,6 +160,36 @@ impl<T> Default for Seat<T> {
             read: CachePadded::new(AtomicUsize::new(0)),
             state: MutSeatState(UnsafeCell::new(SeatState { max: 0, val: None })),
         }
+    }
+}
+
+pub struct SeatGuard<'a, T> {
+    read: &'a CachePadded<AtomicUsize>,
+    val: &'a T,
+}
+
+impl<'a, T> fmt::Debug for SeatGuard<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SeatView")
+            .field("read", &self.read)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, T> Drop for SeatGuard<'a, T> {
+    fn drop(&mut self) {
+        // NOTE
+        // we must extract the value *before* we decrement the number of remaining items otherwise,
+        // the object might be replaced by the time we read it!
+        self.read.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl<'a, T> Deref for SeatGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.val
     }
 }
 
@@ -365,8 +395,8 @@ impl<T> Bus<T> {
         let tail = self.state.tail.load(Ordering::Relaxed);
         BusReader {
             bus: Arc::clone(&self.state),
-            head: tail,
-            cached_tail: tail,
+            head: Cell::new(tail),
+            cached_tail: Cell::new(tail),
         }
     }
 
@@ -429,8 +459,8 @@ impl<T> Drop for Bus<T> {
 /// ```
 pub struct BusReader<T> {
     bus: Arc<BusInner<T>>,
-    head: usize,
-    cached_tail: usize,
+    head: Cell<usize>,
+    cached_tail: Cell<usize>,
 }
 
 impl<T> fmt::Debug for BusReader<T> {
@@ -443,18 +473,18 @@ impl<T> fmt::Debug for BusReader<T> {
     }
 }
 
-impl<T: Clone + Sync> BusReader<T> {
+impl<T: Sync> BusReader<T> {
     /// Attempts to read a broadcast from the bus.
     ///
     /// If the bus is empty, the behavior depends on `block`. If false,
     /// `Err(mpsc::RecvTimeoutError::Timeout)` is returned. Otherwise, the current thread will be
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
-    fn recv_inner(&mut self) -> Result<T, TryRecvError> {
-        let head = self.head;
-        if self.cached_tail == head {
-            self.cached_tail = self.bus.tail.load(Ordering::Acquire);
-            if self.cached_tail == head {
+    fn recv_inner(&self) -> Result<SeatGuard<'_, T>, TryRecvError> {
+        let head = self.head.get();
+        if self.cached_tail.get() == head {
+            self.cached_tail.set(self.bus.tail.load(Ordering::Acquire));
+            if self.cached_tail.get() == head {
                 // buffer is empty, check whether it's closed.
                 // relaxed is fine since Bus.drop does an acquire/release on tail
                 if self.bus.closed.load(Ordering::Relaxed) {
@@ -491,18 +521,16 @@ impl<T: Clone + Sync> BusReader<T> {
         //    that there is no concurrent writer for this seat
         let state = unsafe { &*seat.state.get() };
 
-        // NOTE
-        // we must extract the value *before* we decrement the number of remaining items otherwise,
-        // the object might be replaced by the time we read it!
-        let ret = state
-            .val
-            .clone()
-            .expect("seat that should be occupied was empty");
-
-        seat.read.fetch_add(1, Ordering::Relaxed);
+        let ret = SeatGuard {
+            read: &seat.read,
+            val: state
+                .val
+                .as_ref()
+                .expect("seat that should be occupied was empty"),
+        };
 
         // safe because mask is read-only
-        self.head = (head + 1) & self.bus.mask;
+        self.head.set((head + 1) & self.bus.mask);
         Ok(ret)
     }
 
@@ -547,7 +575,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// j.join().unwrap();
     /// ```
     #[allow(clippy::missing_errors_doc)]
-    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+    pub fn try_recv(&self) -> Result<SeatGuard<'_, T>, TryRecvError> {
         self.recv_inner()
     }
 
@@ -562,7 +590,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// received on this channel. However, since channels are buffered, messages sent before the
     /// disconnect will still be properly received.
     #[allow(clippy::missing_errors_doc)]
-    pub fn recv(&mut self) -> Result<T, RecvError> {
+    pub fn recv(&self) -> Result<SeatGuard<'_, T>, RecvError> {
         loop {
             match self.recv_inner() {
                 Ok(val) => return Ok(val),
@@ -600,7 +628,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// assert_eq!(Err(RecvTimeoutError::Timeout), rx.recv_timeout(timeout));
     /// ```
     #[allow(clippy::missing_errors_doc)]
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<SeatGuard<'_, T>, RecvTimeoutError> {
         let start = Instant::now();
         loop {
             match self.recv_inner() {
