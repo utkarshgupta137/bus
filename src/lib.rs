@@ -365,7 +365,6 @@ impl<T> Bus<T> {
         BusReader {
             bus: Arc::clone(&self.state),
             head: self.state.tail.load(Ordering::Relaxed),
-            closed: false,
         }
     }
 
@@ -429,7 +428,6 @@ impl<T> Drop for Bus<T> {
 pub struct BusReader<T> {
     bus: Arc<BusInner<T>>,
     head: usize,
-    closed: bool,
 }
 
 impl<T> fmt::Debug for BusReader<T> {
@@ -437,7 +435,6 @@ impl<T> fmt::Debug for BusReader<T> {
         f.debug_struct("BusReader")
             .field("bus", &self.bus)
             .field("head", &self.head)
-            .field("closed", &self.closed)
             .finish()
     }
 }
@@ -450,17 +447,12 @@ impl<T: Clone + Sync> BusReader<T> {
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
     fn recv_inner(&mut self) -> Result<T, TryRecvError> {
-        if self.closed {
-            return Err(TryRecvError::Disconnected);
-        }
-
         let tail = self.bus.tail.load(Ordering::Acquire);
         if tail == self.head {
             // buffer is empty, check whether it's closed.
             // relaxed is fine since Bus.drop does an acquire/release on tail
             if self.bus.closed.load(Ordering::Relaxed) {
                 // the bus is closed, and we didn't miss anything!
-                self.closed = true;
                 return Err(TryRecvError::Disconnected);
             }
 
