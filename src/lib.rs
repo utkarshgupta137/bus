@@ -230,12 +230,12 @@ impl<T> Bus<T> {
     fn broadcast_inner(&mut self, val: T) -> Result<(), T> {
         let tail = self.state.tail.load(Ordering::Relaxed);
 
-        unsafe { &mut *(&self.state.ring[tail]).state.get() }.val = Some(val);
+        unsafe { &mut *(&self.state.ring[tail & self.state.mask]).state.get() }.val = Some(val);
 
         // now tell readers that they can read
         self.state
             .tail
-            .store((tail + 1) & self.state.mask, Ordering::Release);
+            .store(tail.wrapping_add(1), Ordering::Release);
 
         Ok(())
     }
@@ -410,15 +410,17 @@ impl<T: Clone + Sync> BusReader<T> {
             }
 
             return Err(TryRecvError::Empty);
+        } else if tail >= head + self.bus.mask {
+            panic!("bus overflow");
         }
 
-        let ret = unsafe { &*(&self.bus.ring[head]).state.get() }
+        let ret = unsafe { &*(&self.bus.ring[head & self.bus.mask]).state.get() }
             .val
             .clone()
             .expect("seat that should be occupied was empty");
 
         // safe because mask is read-only
-        self.head = (head + 1) & self.bus.mask;
+        self.head = head.wrapping_add(1);
         Ok(ret)
     }
 
