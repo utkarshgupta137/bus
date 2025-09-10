@@ -362,9 +362,11 @@ impl<T> Bus<T> {
     pub fn add_rx(&mut self) -> BusReader<T> {
         self.readers += 1;
 
+        let tail = self.state.tail.load(Ordering::Relaxed);
         BusReader {
             bus: Arc::clone(&self.state),
-            head: self.state.tail.load(Ordering::Relaxed),
+            head: tail,
+            cached_tail: tail,
         }
     }
 
@@ -428,6 +430,7 @@ impl<T> Drop for Bus<T> {
 pub struct BusReader<T> {
     bus: Arc<BusInner<T>>,
     head: usize,
+    cached_tail: usize,
 }
 
 impl<T> fmt::Debug for BusReader<T> {
@@ -435,6 +438,7 @@ impl<T> fmt::Debug for BusReader<T> {
         f.debug_struct("BusReader")
             .field("bus", &self.bus)
             .field("head", &self.head)
+            .field("cached_tail", &self.cached_tail)
             .finish()
     }
 }
@@ -447,19 +451,21 @@ impl<T: Clone + Sync> BusReader<T> {
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
     fn recv_inner(&mut self) -> Result<T, TryRecvError> {
-        let tail = self.bus.tail.load(Ordering::Acquire);
-        if tail == self.head {
-            // buffer is empty, check whether it's closed.
-            // relaxed is fine since Bus.drop does an acquire/release on tail
-            if self.bus.closed.load(Ordering::Relaxed) {
-                // the bus is closed, and we didn't miss anything!
-                return Err(TryRecvError::Disconnected);
-            }
+        let head = self.head;
+        if self.cached_tail == head {
+            self.cached_tail = self.bus.tail.load(Ordering::Acquire);
+            if self.cached_tail == head {
+                // buffer is empty, check whether it's closed.
+                // relaxed is fine since Bus.drop does an acquire/release on tail
+                if self.bus.closed.load(Ordering::Relaxed) {
+                    // the bus is closed, and we didn't miss anything!
+                    return Err(TryRecvError::Disconnected);
+                }
 
-            return Err(TryRecvError::Empty);
+                return Err(TryRecvError::Empty);
+            }
         }
 
-        let head = self.head;
         let seat = &self.bus.ring[head];
 
         // take is used by a reader to extract a copy of the value stored on this seat. only readers
