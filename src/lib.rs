@@ -108,7 +108,6 @@ use std::time::{Duration, Instant};
 use crossbeam_utils::CachePadded;
 
 struct SeatState<T> {
-    max: usize,
     val: Option<T>,
 }
 
@@ -141,24 +140,19 @@ impl<T> fmt::Debug for MutSeatState<T> {
 /// The `read` attribute is used to ensure that readers see the most recent write to the seat when
 /// they access it. This is done using `Ordering::Acquire` and `Ordering::Release`.
 struct Seat<T> {
-    read: CachePadded<AtomicUsize>,
     state: MutSeatState<T>,
 }
 
 impl<T> fmt::Debug for Seat<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Seat")
-            .field("read", &self.read)
-            .field("state", &self.state)
-            .finish()
+        f.debug_struct("Seat").field("state", &self.state).finish()
     }
 }
 
 impl<T> Default for Seat<T> {
     fn default() -> Self {
         Self {
-            read: CachePadded::new(AtomicUsize::new(0)),
-            state: MutSeatState(UnsafeCell::new(SeatState { max: 0, val: None })),
+            state: MutSeatState(UnsafeCell::new(SeatState { val: None })),
         }
     }
 }
@@ -176,8 +170,7 @@ struct BusInner<T> {
 impl<T> fmt::Debug for BusInner<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BusInner")
-            .field("ring", &self.ring)
-            .field("len", &(self.mask + 1))
+            .field("len", &self.ring.len())
             .field("tail", &self.tail)
             .field("closed", &self.closed)
             .finish()
@@ -237,53 +230,12 @@ impl<T> Bus<T> {
     fn broadcast_inner(&mut self, val: T) -> Result<(), T> {
         let tail = self.state.tail.load(Ordering::Relaxed);
 
-        // we want to check if the next element over is free to ensure that we always leave one
-        // empty space between the head and the tail. This is necessary so that readers can
-        // distinguish between an empty and a full list. If the fence seat is free, the seat at
-        // tail must also be free, which is simple enough to show by induction (exercise for the
-        // reader).
-        let fence = (tail + 1) & self.state.mask;
+        unsafe { &mut *(&self.state.ring[tail]).state.get() }.val = Some(val);
 
-        let last = &self.state.ring[fence];
-        let fence_read = last.read.load(Ordering::Relaxed);
-        // Get the expected number of reads for the given seat. This number will always be
-        // conservative, in that fewer reads may be fine. Specifically, `.rleft` may not be
-        // sufficiently up-to-date to account for all readers that have left.
-        // since only the producer will modify the ring, and &mut self guarantees that *we* are the
-        // producer, no-one is modifying the ring. Multiple read-only borrows are safe, and so the
-        // cast below is safe.
-        let expected = unsafe { &*last.state.get() }.max;
-
-        // is the fence block now free?
-        if fence_read == expected {
-            // yes! go ahead and write!
-        } else {
-            // no, and blocking isn't allowed, so return an error
-            return Err(val);
-        }
-
-        // next one over is free, we have a free seat!
-        let readers = self.readers;
-        {
-            let next = &self.state.ring[tail];
-            // we are the only writer, so no-one else can be writing. however, since we're
-            // mutating state, we also need for there to be no readers for this to be safe. the
-            // argument for why this is the case is roughly an inverse of the argument for why
-            // the unsafe block in Seat.take() is safe.  basically, since
-            //
-            //   .read + .rleft == .max
-            //
-            // we know all readers at the time of the seat's previous write have accessed this
-            // seat. we also know that no other readers will access that seat (they must have
-            // started at later seats). thus, we are the only thread accessing this seat, and
-            // so we can safely access it as mutable.
-            let state = unsafe { &mut *next.state.get() };
-            state.max = readers;
-            state.val = Some(val);
-            next.read.store(0, Ordering::Relaxed);
-        }
         // now tell readers that they can read
-        self.state.tail.store(fence, Ordering::Release);
+        self.state
+            .tail
+            .store((tail + 1) & self.state.mask, Ordering::Release);
 
         Ok(())
     }
@@ -447,8 +399,9 @@ impl<T: Clone + Sync> BusReader<T> {
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
     fn recv_inner(&mut self) -> Result<T, TryRecvError> {
+        let head = self.head;
         let tail = self.bus.tail.load(Ordering::Acquire);
-        if tail == self.head {
+        if tail == head {
             // buffer is empty, check whether it's closed.
             // relaxed is fine since Bus.drop does an acquire/release on tail
             if self.bus.closed.load(Ordering::Relaxed) {
@@ -459,41 +412,10 @@ impl<T: Clone + Sync> BusReader<T> {
             return Err(TryRecvError::Empty);
         }
 
-        let head = self.head;
-        let seat = &self.bus.ring[head];
-
-        // take is used by a reader to extract a copy of the value stored on this seat. only readers
-        // that were created strictly before the time this seat was last written to by the producer
-        // are allowed to call this method, and they may each only call it once.
-        // the writer will only modify this element when .read hits .max - writer.rleft[i]. we can
-        // be sure that this is not currently the case (which means it's safe for us to read)
-        // because:
-        //
-        //  - .max is set to the number of readers at the time when the write happens
-        //  - any joining readers will start at a later seat
-        //  - so, at most .max readers will call .take() on this seat this time around the buffer
-        //  - a reader must leave either *before* or *after* a call to recv. there are two cases:
-        //
-        //    - it leaves before, rleft is decremented, but .take is not called
-        //    - it leaves after, .take is called, but head has been incremented, so rleft will be
-        //      decremented for the *next* seat, not this one
-        //
-        //    so, either .take is called, and .read is incremented, or writer.rleft is incremented.
-        //    thus, for a writer to modify this element, *all* readers at the time of the previous
-        //    write to this seat must have either called .take or have left.
-        //  - since we are one of those readers, this cannot be true, so it's safe for us to assume
-        //    that there is no concurrent writer for this seat
-        let state = unsafe { &*seat.state.get() };
-
-        // NOTE
-        // we must extract the value *before* we decrement the number of remaining items otherwise,
-        // the object might be replaced by the time we read it!
-        let ret = state
+        let ret = unsafe { &*(&self.bus.ring[head]).state.get() }
             .val
             .clone()
             .expect("seat that should be occupied was empty");
-
-        seat.read.fetch_add(1, Ordering::Relaxed);
 
         // safe because mask is read-only
         self.head = (head + 1) & self.bus.mask;
