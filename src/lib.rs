@@ -97,7 +97,7 @@
 //! assert_eq!(rx2.recv(), Ok("world"));
 //! ```
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -316,7 +316,7 @@ impl<T> Bus<T> {
 
         BusReader {
             bus: Arc::clone(&self.state),
-            head: self.state.tail.load(Ordering::Relaxed),
+            head: Cell::new(self.state.tail.load(Ordering::Relaxed)),
         }
     }
 
@@ -379,7 +379,7 @@ impl<T> Drop for Bus<T> {
 /// ```
 pub struct BusReader<T> {
     bus: Arc<BusInner<T>>,
-    head: usize,
+    head: Cell<usize>,
 }
 
 impl<T> fmt::Debug for BusReader<T> {
@@ -398,8 +398,8 @@ impl<T: Clone + Sync> BusReader<T> {
     /// `Err(mpsc::RecvTimeoutError::Timeout)` is returned. Otherwise, the current thread will be
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
-    fn recv_inner(&mut self) -> Result<T, TryRecvError> {
-        let head = self.head;
+    fn recv_inner(&self) -> Result<&T, TryRecvError> {
+        let head = self.head.get();
         let tail = self.bus.tail.load(Ordering::Acquire);
         if tail == head {
             // buffer is empty, check whether it's closed.
@@ -416,11 +416,11 @@ impl<T: Clone + Sync> BusReader<T> {
 
         let ret = unsafe { &*(&self.bus.ring[head & self.bus.mask]).state.get() }
             .val
-            .clone()
+            .as_ref()
             .expect("seat that should be occupied was empty");
 
         // safe because mask is read-only
-        self.head = head.wrapping_add(1);
+        self.head.set(head.wrapping_add(1));
         Ok(ret)
     }
 
@@ -465,7 +465,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// j.join().unwrap();
     /// ```
     #[allow(clippy::missing_errors_doc)]
-    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+    pub fn try_recv(&self) -> Result<&T, TryRecvError> {
         self.recv_inner()
     }
 
@@ -480,7 +480,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// received on this channel. However, since channels are buffered, messages sent before the
     /// disconnect will still be properly received.
     #[allow(clippy::missing_errors_doc)]
-    pub fn recv(&mut self) -> Result<T, RecvError> {
+    pub fn recv(&self) -> Result<&T, RecvError> {
         loop {
             match self.recv_inner() {
                 Ok(val) => return Ok(val),
@@ -518,7 +518,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// assert_eq!(Err(RecvTimeoutError::Timeout), rx.recv_timeout(timeout));
     /// ```
     #[allow(clippy::missing_errors_doc)]
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<&T, RecvTimeoutError> {
         let start = Instant::now();
         loop {
             match self.recv_inner() {
